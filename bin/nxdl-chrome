@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PORT="${NXDL_CDP_PORT:-9222}"
+PROFILE="${NXDL_CHROME_PROFILE:-$HOME/.local/share/nxdl/chrome-profile}"
+SRC="${NXDL_CHROME_SRC:-$HOME/.config/google-chrome}"
+CHROME="${NXDL_CHROME:-$(command -v google-chrome-stable || command -v google-chrome || true)}"
+[ -n "$CHROME" ] || CHROME=/run/current-system/sw/bin/google-chrome-stable
+
+if curl -s -m1 "http://127.0.0.1:$PORT/json/version" >/dev/null 2>&1; then
+  echo "nxdl-chrome: already listening on $PORT"
+  exit 0
+fi
+
+[ -x "$CHROME" ] || { echo "nxdl-chrome: chrome binary not found" >&2; exit 1; }
+
+if [ ! -f "$PROFILE/Default/Preferences" ]; then
+  echo "nxdl-chrome: seeding debug profile from $SRC (keeps your logins)"
+  mkdir -p "$PROFILE"
+  cp -a "$SRC/." "$PROFILE/" 2>/dev/null || true
+fi
+rm -f "$PROFILE/SingletonLock" "$PROFILE/SingletonSocket" "$PROFILE/SingletonCookie"
+
+echo "nxdl-chrome: launching on port $PORT"
+setsid "$CHROME" \
+  --user-data-dir="$PROFILE" \
+  --remote-debugging-port="$PORT" \
+  --no-first-run --no-default-browser-check \
+  >/dev/null 2>&1 &
+
+for _ in $(seq 1 30); do
+  if curl -s -m1 "http://127.0.0.1:$PORT/json/version" >/dev/null 2>&1; then
+    echo "nxdl-chrome: ready on $PORT"
+    exit 0
+  fi
+  sleep 1
+done
+echo "nxdl-chrome: chrome did not expose port $PORT in time" >&2
+exit 1

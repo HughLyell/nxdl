@@ -1,0 +1,14 @@
+{
+  "name": "nxdl",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Autonomous Nexus Mods downloader: REST API client + trusted-input browser automation via CDP.",
+  "type": "module",
+  "license": "MIT",
+  "scripts": {
+    "start": "node src/browser-dl.mjs"
+  },
+  "dependencies": {
+    "playwright-core": "^1.63.0"
+  }
+}

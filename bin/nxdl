@@ -1,0 +1,277 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+API_BASE="${NEXUS_API_BASE:-https://api.nexusmods.com/v1}"
+APP_NAME="nxdl"
+APP_VER="0.1.0"
+KEY_FILE="${NEXUS_KEY_FILE:-$HOME/.config/nexus-dl/key}"
+DL_DIR="${NXDL_DL_DIR:-$HOME/Downloads}"
+LOG_FILE="${NXDL_LOG:-$HOME/.cache/nxdl/nxm.log}"
+SCRIPT="$(readlink -f "$0")"
+LAST_CODE=""
+KEY=""
+BODY=""
+
+die() { printf 'nxdl: %s\n' "$*" >&2; exit 1; }
+
+log() {
+  mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null || true
+  printf '%s %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$*" >> "$LOG_FILE" 2>/dev/null || true
+}
+
+usage() {
+  cat <<'EOF'
+nxdl - Nexus Mods API client and nxm:// handler
+
+usage:
+  nxdl whoami
+  nxdl mod      <game_domain> <mod_id>
+  nxdl files    <game_domain> <mod_id>
+  nxdl dl       <game_domain> <mod_id> <file_id> [outdir]
+  nxdl nxm      <nxm://...>
+  nxdl register
+
+config:
+  NEXUS_API_KEY    personal API key (takes precedence)
+  NEXUS_KEY_FILE   key file, default ~/.config/nexus-dl/key
+  NXDL_DL_DIR      download directory, default ~/Downloads
+
+notes:
+  * An API key is required. A website login does not authenticate the API.
+    Create one at https://www.nexusmods.com/users/myaccount?tab=api
+  * "dl" without nxm parameters uses the keyless API path, which is
+    Premium-only (free accounts get HTTP 403).
+  * "nxm" redeems a site-generated link, which is the same path a mod
+    manager uses; it may work for free accounts.
+  * "register" installs this script as the x-scheme-handler/nxm handler.
+  * game_domain is the slug in the URL, e.g. cyberpunk2077.
+EOF
+}
+
+resolve_key() {
+  if [[ -n "${NEXUS_API_KEY:-}" ]]; then
+    KEY="$NEXUS_API_KEY"
+    return 0
+  fi
+  if [[ -f "$KEY_FILE" ]]; then
+    KEY="$(tr -d '[:space:]' < "$KEY_FILE")"
+    return 0
+  fi
+  return 1
+}
+
+api() {
+  local path="$1" out
+  out="$(curl -sS -w $'\n%{http_code}' \
+    -H "apikey: $KEY" \
+    -H "Application-Name: $APP_NAME" \
+    -H "Application-Version: $APP_VER" \
+    -H "User-Agent: $APP_NAME/$APP_VER" \
+    "$API_BASE$path")"
+  LAST_CODE="${out##*$'\n'}"
+  BODY="${out%$'\n'*}"
+}
+
+require_ok() {
+  [[ -n "$LAST_CODE" ]] || die "network error: no response from $API_BASE"
+  [[ "$LAST_CODE" == "200" ]] || die "api returned HTTP $LAST_CODE"
+}
+
+cmd_whoami() {
+  api "/users/validate.json"
+  require_ok
+  printf '%s' "$BODY" | perl -MJSON::PP -0777 -ne '
+    my $d = decode_json($_);
+    printf "user:      %s (%s)\n", $d->{name}, $d->{user_id};
+    printf "premium:   %s\n", $d->{is_premium} ? "yes" : "no";
+    printf "supporter: %s\n", $d->{is_supporter} ? "yes" : "no";
+  '
+}
+
+cmd_mod() {
+  local game="$1" id="$2"
+  api "/games/$game/mods/$id.json"
+  require_ok
+  printf '%s' "$BODY" | perl -MJSON::PP -0777 -ne '
+    my $d = decode_json($_);
+    printf "name:    %s\n", $d->{name};
+    printf "id:      %s\n", $d->{mod_id};
+    printf "version: %s\n", $d->{version} // "";
+    printf "author:  %s\n", $d->{author} // "";
+    printf "status:  %s\n", $d->{status} // "";
+    printf "summary: %s\n", $d->{summary} // "";
+  '
+}
+
+cmd_files() {
+  local game="$1" id="$2"
+  api "/games/$game/mods/$id/files.json"
+  require_ok
+  printf '%s' "$BODY" | perl -MJSON::PP -0777 -ne '
+    my $d = decode_json($_);
+    my $list = ref($d) eq "ARRAY" ? $d : ($d->{files} // []);
+    printf "%-9s %-14s %-10s %s\n", "FILE_ID", "VERSION", "SIZE", "NAME";
+    for my $f (@$list) {
+      my $v = $f->{mod_version} // $f->{version} // "";
+      my $b = $f->{size_in_bytes}
+        // (defined $f->{size_kb} ? $f->{size_kb} * 1024 : undef)
+        // $f->{size} // 0;
+      printf "%-9s %-14s %-10s %s\n",
+        $f->{file_id}, $v, fmt($b), ($f->{name} // $f->{file_name} // "");
+    }
+    sub fmt {
+      my $b = shift;
+      my @u = qw(B KiB MiB GiB TiB);
+      my $i = 0;
+      while ($b >= 1024 && $i < $#u) { $b /= 1024; $i++ }
+      return $i ? sprintf("%.1f%s", $b, $u[$i]) : sprintf("%d%s", $b, $u[$i]);
+    }
+  '
+}
+
+resolve_and_download() {
+  local path="$1" outdir="$2" pair uri name
+  api "$path"
+  if [[ "$LAST_CODE" == "403" ]]; then
+    log "fail http=403 premium-only path=${path%%\?*}"
+    die "HTTP 403: Nexus refused the download link (keyless API access is Premium-only; free accounts must use a site-generated nxm link or the website)."
+  fi
+  if [[ "$LAST_CODE" == "410" ]]; then
+    log "fail http=410 expired path=${path%%\?*}"
+    die "HTTP 410: the nxm link has expired. Click 'Mod manager download' on the mod page again for a fresh link."
+  fi
+  require_ok
+  pair="$(printf '%s' "$BODY" | perl -MJSON::PP -0777 -ne '
+    my $d = decode_json($_);
+    my $list;
+    if    (ref($d) eq "ARRAY")                   { $list = $d }
+    elsif (ref($d->{download_links}) eq "ARRAY") { $list = $d->{download_links} }
+    elsif (ref($d->{download_link}) eq "ARRAY")  { $list = $d->{download_link} }
+    elsif (ref($d->{download_link}) eq "HASH")   { $list = [$d->{download_link}] }
+    elsif (ref($d->{links}) eq "ARRAY")          { $list = $d->{links} }
+    elsif ($d->{URI})                            { $list = [$d] }
+    else                                         { $list = [] }
+    my $l = $list->[0] or die "nxdl: no download links in response\n";
+    my $n = $l->{short_name} // $l->{name} // $l->{file_name} // "";
+    if ($n eq "" || $n eq "Nexus CDN" || $n !~ /\./) {
+      my $u = $l->{URI} // "";
+      if ($u =~ m{/([^/?\#]+)(?:[?\#]|$)}) { $n = $1 }
+    }
+    $n = "download.bin" if $n eq "";
+    $n =~ s/[\\\/:*?"<>|]//g;
+    print "$l->{URI}\t$n\n";
+  ')"
+  uri="${pair%%$'\t'*}"
+  name="${pair#*$'\t'}"
+  mkdir -p "$outdir"
+  if [[ -z "$uri" ]]; then
+    log "fail empty-uri"
+    die "API response contained no download URI"
+  fi
+  [[ "$uri" == /* ]] && uri="https://www.nexusmods.com$uri"
+  local host="${uri#*://}"; host="${host%%/*}"
+  printf 'nxdl: downloading %s from %s -> %s\n' "$name" "$host" "$outdir"
+  local code rc=0
+  code="$(curl -L --progress-bar -S -A 'Mozilla/5.0 (X11; Linux x86_64; rv:130.0) Gecko/20100101 Firefox/130.0' -w '%{http_code}' -o "$outdir/$name" "$uri")" || rc=$?
+  if [[ $rc -ne 0 ]]; then
+    log "fail curl rc=$rc host=$host name=$name"
+    die "download failed (curl rc=$rc) from $host"
+  fi
+  if [[ "$code" != "200" ]]; then
+    log "fail http=$code host=$host name=$name"
+    die "download failed: HTTP $code from $host"
+  fi
+  printf 'nxdl: saved %s\n' "$outdir/$name"
+  log "ok http=200 saved=$outdir/$name"
+}
+
+cmd_dl() {
+  local game="$1" id="$2" fid="$3" outdir="${4:-$DL_DIR}"
+  resolve_and_download "/games/$game/mods/$id/files/$fid/download_link.json" "$outdir"
+}
+
+ensure_terminal() {
+  [[ -t 1 ]] && return 0
+  [[ -n "${NXDL_TERM:-}" ]] && return 0
+  local term
+  for term in konsole xterm; do
+    command -v "$term" >/dev/null 2>&1 || continue
+    export NXDL_TERM=1
+    case "$term" in
+      konsole) exec konsole --hold -e "$SCRIPT" "$@" ;;
+      xterm)   exec xterm -hold -e "$SCRIPT" "$@" ;;
+    esac
+  done
+  return 0
+}
+
+cmd_nxm() {
+  local url="$1"
+  [[ "$url" == nxm://* ]] || die "not an nxm:// url: $url"
+  ensure_terminal nxm "$url"
+  local rest="${url#nxm://}"
+  local query=""
+  [[ "$rest" == *\?* ]] && query="${rest#*\?}"
+  local host_path="${rest%%\?*}"
+  local game p1 mod_id p2 file_id
+  IFS='/' read -r game p1 mod_id p2 file_id _ <<< "$host_path"
+  case "$p1" in
+    collections)
+      die "collection nxm links are not supported by nxdl; open this link in Vortex or Mod Organizer 2."
+      ;;
+    mods)
+      [[ "$p2" == "files" && -n "$mod_id" && -n "$file_id" ]] \
+        || die "cannot parse nxm link: $url"
+      ;;
+    *)
+      die "cannot parse nxm link: $url"
+      ;;
+  esac
+  local path="/games/$game/mods/$mod_id/files/$file_id/download_link.json"
+  [[ -n "$query" ]] && path="$path?$query"
+  printf 'nxdl: game=%s mod=%s file=%s\n' "$game" "$mod_id" "$file_id"
+  log "nxm game=$game mod=$mod_id file=$file_id"
+  resolve_and_download "$path" "$DL_DIR"
+}
+
+cmd_register() {
+  local apps="$HOME/.local/share/applications"
+  local df="$apps/nxdl-nxm.desktop"
+  mkdir -p "$apps"
+  cat > "$df" <<EOF
+[Desktop Entry]
+Type=Application
+Name=Nexus Mods Downloader (nxdl)
+Comment=Handle nxm:// links
+Exec=$SCRIPT nxm %u
+Terminal=false
+NoDisplay=true
+MimeType=x-scheme-handler/nxm;
+EOF
+  xdg-mime default nxdl-nxm.desktop x-scheme-handler/nxm
+  if command -v update-desktop-database >/dev/null 2>&1; then
+    update-desktop-database "$apps" >/dev/null 2>&1 || true
+  fi
+  printf 'installed: %s\n' "$df"
+  printf 'default  : %s\n' "$(xdg-mime query default x-scheme-handler/nxm)"
+}
+
+main() {
+  [[ $# -ge 1 ]] || { usage; exit 1; }
+  local cmd="$1"; shift
+  case "$cmd" in
+    -h|--help|help) usage; return ;;
+    register) cmd_register; return ;;
+  esac
+  resolve_key || die "no API key. write it to $KEY_FILE or set NEXUS_API_KEY (create one at https://www.nexusmods.com/users/myaccount?tab=api)"
+  case "$cmd" in
+    whoami) cmd_whoami ;;
+    mod)    [[ $# -eq 2 ]] || die "usage: nxdl mod <game> <mod_id>"; cmd_mod "$1" "$2" ;;
+    files)  [[ $# -eq 2 ]] || die "usage: nxdl files <game> <mod_id>"; cmd_files "$1" "$2" ;;
+    dl)     [[ $# -ge 3 ]] || die "usage: nxdl dl <game> <mod_id> <file_id> [outdir]"; cmd_dl "$@" ;;
+    nxm)    [[ $# -eq 1 ]] || die "usage: nxdl nxm <nxm://...>"; cmd_nxm "$1" ;;
+    *) die "unknown command: $cmd (try --help)" ;;
+  esac
+}
+
+main "$@"
