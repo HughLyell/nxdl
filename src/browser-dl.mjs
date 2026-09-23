@@ -10,6 +10,16 @@ const UA = "Mozilla/5.0 (X11; Linux x86_64; rv:130.0) Gecko/20100101 Firefox/130
 
 const log = (...a) => console.log("[nxdl-browser]", ...a);
 
+const JSON_MODE = process.env.NXDL_JSON === "1";
+function emitOk(file) {
+  console.log(JSON_MODE ? JSON.stringify({ ok: true, file }) : "SAVED " + file);
+}
+function die(msg, code = 1) {
+  if (JSON_MODE) console.error(JSON.stringify({ ok: false, error: msg }));
+  else console.error(msg);
+  process.exit(code);
+}
+
 function apiKey() {
   if (process.env.NEXUS_API_KEY) return process.env.NEXUS_API_KEY.trim();
   const kf = process.env.NEXUS_KEY_FILE || path.join(HOME, ".config/nexus-dl/key");
@@ -149,7 +159,7 @@ async function main() {
   }
   if (stable) {
     log("saved (chrome) " + stable);
-    console.log("SAVED " + stable);
+    emitOk(stable);
     process.exit(0);
   }
 
@@ -168,18 +178,16 @@ async function main() {
     try {
       const saved = await fetchDirect(href, outDir);
       log("saved (direct) " + saved);
-      console.log("SAVED " + saved);
+      emitOk(saved);
       process.exit(0);
     } catch (e) {
       log("direct fetch failed: " + e.message);
     }
   }
 
-  console.error("TIMEOUT: no file downloaded to " + outDir);
-  process.exit(2);
+  die("timeout: no file downloaded to " + outDir, 2);
 }
 
 main().catch((e) => {
-  console.error("error:", e?.message || e);
-  process.exit(1);
+  die("error: " + (e?.message || e), 1);
 });
