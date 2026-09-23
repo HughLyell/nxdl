@@ -29,6 +29,17 @@ To pick a specific file first:
 nxdl files <game_domain> <mod_id>      # columns: FILE_ID VERSION SIZE NAME
 ```
 
+## Download many mods (batch)
+
+```bash
+nxdl-browser --batch <list-file> [--delay <sec>] [--json]
+```
+
+List file: one target per line (`<game> <mod> [file] [outdir]` or a files URL),
+`#` comments allowed, `-` reads stdin. Items are downloaded sequentially and the
+run **continues past failures**. Exit `0` only if all succeeded. In JSON mode it
+prints one object: `{"ok":bool,"results":[...],"succeeded":n,"failed":m}`.
+
 ## Other commands
 
 ```bash

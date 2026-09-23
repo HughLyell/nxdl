@@ -8,16 +8,26 @@ const DEFAULT_OUT = process.env.NXDL_DL_DIR || path.join(HOME, "Downloads");
 const TIMEOUT = Number(process.env.NXDL_TIMEOUT_MS || 240000);
 const UA = "Mozilla/5.0 (X11; Linux x86_64; rv:130.0) Gecko/20100101 Firefox/130.0";
 
-const log = (...a) => console.log("[nxdl-browser]", ...a);
+let jsonMode = process.env.NXDL_JSON === "1";
+const log = (...a) => console.error("[nxdl-browser]", ...a);
+const sleep = (s) => new Promise((r) => setTimeout(r, s * 1000));
 
-const JSON_MODE = process.env.NXDL_JSON === "1";
-function emitOk(file) {
-  console.log(JSON_MODE ? JSON.stringify({ ok: true, file }) : "SAVED " + file);
-}
 function die(msg, code = 1) {
-  if (JSON_MODE) console.error(JSON.stringify({ ok: false, error: msg }));
+  if (jsonMode) process.stdout.write(JSON.stringify({ ok: false, error: msg }) + "\n");
   else console.error(msg);
   process.exit(code);
+}
+
+function usage() {
+  console.error(`usage:
+  nxdl-browser <game> <mod_id> [file_id] [outdir]
+  nxdl-browser <nexusmods-files-url> [outdir]
+  nxdl-browser --batch <list-file> [--delay <sec>] [--json]
+
+batch list lines:
+  <game> <mod_id> [file_id] [outdir]
+  <nexusmods-files-url> [outdir]
+  # comments and blank lines ignored; use "-" to read stdin`);
 }
 
 function apiKey() {
@@ -31,8 +41,8 @@ async function resolveFileId(game, mod) {
     headers: {
       apikey: apiKey(),
       "Application-Name": "nxdl",
-      "Application-Version": "0.1.0",
-      "User-Agent": "nxdl/0.1.0",
+      "Application-Version": "1.0.0",
+      "User-Agent": "nxdl/1.0.0",
     },
   });
   if (!res.ok) throw new Error("files.json HTTP " + res.status);
@@ -60,68 +70,80 @@ async function fetchDirect(href, outDir) {
   const out = path.join(outDir, name);
   const buf = Buffer.from(await res.arrayBuffer());
   if (!buf.length) throw new Error("CDN returned 0 bytes");
-  if (!/\.(zip|7z|rar|zipx|tar|gz)$/i.test(name)) {
-    // CDN gave an opaque token name; try to recover a real name from a sibling download
-    name = name + ".bin";
-  }
   fs.writeFileSync(out, buf);
   return out;
 }
 
-async function main() {
-  const a = process.argv.slice(2);
-  if (!a[0]) {
-    console.error("usage: nxdl-browser <nexusmods-files-url> [outdir]");
-    console.error("       nxdl-browser <game> <mod_id> [file_id] [outdir]");
-    process.exit(1);
+function parseLine(line, defaultOut) {
+  const toks = line.trim().split(/\s+/).filter(Boolean);
+  if (!toks.length || toks[0].startsWith("#")) return null;
+  if (/^https?:\/\//.test(toks[0])) {
+    return { target: toks[0], outDir: toks[1] || defaultOut, label: toks[0] };
+  }
+  const [game, mod, third, fourth] = toks;
+  if (!game || !mod) throw new Error("bad line: " + line);
+  let file = null, out = null;
+  if (third && /^\d+$/.test(third)) { file = third; out = fourth; } else { out = third; }
+  return { game, mod, file, outDir: out || defaultOut, label: `${game}/${mod}${file ? "/" + file : ""}` };
+}
+
+function parseArgs(argv) {
+  const jobs = [];
+  const positionals = [];
+  let batchFile = null;
+  let delay = 0;
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === "--help" || a === "-h") { usage(); process.exit(0); }
+    else if (a === "--json") jsonMode = true;
+    else if (a === "--batch" || a === "-b") batchFile = argv[++i];
+    else if (a.startsWith("--batch=")) batchFile = a.slice(8);
+    else if (a === "--delay") delay = Number(argv[++i] || 0);
+    else if (a.startsWith("--delay=")) delay = Number(a.slice(8));
+    else if (a.startsWith("-") && a !== "-") { usage(); die("unknown option: " + a); }
+    else positionals.push(a);
   }
 
-  let target, outArg;
-  if (/^https?:\/\//.test(a[0])) {
-    target = a[0];
-    outArg = a[1];
-  } else {
-    const [game, mod, third, fourth] = a;
-    if (!game || !mod) {
-      console.error("usage: nxdl-browser <game> <mod_id> [file_id] [outdir]");
-      process.exit(1);
+  if (batchFile) {
+    const text = batchFile === "-" ? fs.readFileSync(0, "utf8") : fs.readFileSync(batchFile, "utf8");
+    for (const line of text.split(/\r?\n/)) {
+      const job = parseLine(line, DEFAULT_OUT);
+      if (job) jobs.push(job);
     }
-    let file = null, out = null;
-    if (third && /^\d+$/.test(third)) { file = third; out = fourth; } else { out = third; }
-    if (!file) file = await resolveFileId(game, mod);
-    target = `https://www.nexusmods.com/${game}/mods/${mod}?tab=files&file_id=${file}`;
-    outArg = out;
+  } else if (positionals.length) {
+    jobs.push(parseLine(positionals.join(" "), DEFAULT_OUT));
+  } else {
+    usage();
+    process.exit(1);
   }
-  const outDir = outArg || DEFAULT_OUT;
+  return { jobs, delay };
+}
+
+async function downloadOne(page, job, cdp) {
+  if (!job.target) {
+    if (!job.file) job.file = await resolveFileId(job.game, job.mod);
+    job.target = `https://www.nexusmods.com/${job.game}/mods/${job.mod}?tab=files&file_id=${job.file}`;
+    job.label = `${job.game}/${job.mod}/${job.file}`;
+  }
+  const outDir = job.outDir;
   fs.mkdirSync(outDir, { recursive: true });
   const before = new Set(fs.readdirSync(outDir));
 
-  const browser = await chromium.connectOverCDP(CDP);
-  const ctx = browser.contexts()[0];
-  if (!ctx) throw new Error("no browser context over CDP");
-  const page =
-    ctx.pages().find((p) => /nexusmods\.com/.test(p.url())) ||
-    ctx.pages()[0] ||
-    (await ctx.newPage());
-
-  const cdp = await ctx.newCDPSession(page).catch(() => null);
   if (cdp) {
     await cdp.send("Browser.setDownloadBehavior", { behavior: "allow", downloadPath: outDir, eventsEnabled: true }).catch(() => {});
   }
 
-  log("navigating", target);
-  await page.goto(target, { waitUntil: "domcontentloaded", timeout: 60000 });
+  log("navigating", job.target);
+  await page.goto(job.target, { waitUntil: "domcontentloaded", timeout: 60000 });
   await page.waitForTimeout(2500);
 
   const slow = page.locator('button:has-text("Slow download"), a:has-text("Slow download")').first();
   const manual = page.getByRole("link", { name: /manual download/i }).first();
-
   if ((await manual.count()) > 0 && !(await slow.isVisible().catch(() => false))) {
     log("clicking Manual download");
     await manual.click({ timeout: 15000 }).catch((e) => log("manual click:", e.message));
     await page.waitForTimeout(2000);
   }
-
   try {
     await slow.waitFor({ state: "visible", timeout: 30000 });
     log("clicking Slow download");
@@ -131,7 +153,6 @@ async function main() {
   }
 
   const deadline = Date.now() + TIMEOUT;
-
   const newest = () => {
     let best = null;
     for (const f of fs.readdirSync(outDir)) {
@@ -145,25 +166,19 @@ async function main() {
     return best;
   };
 
-  // Preferred: let Chrome download it (trusted click gives a proper filename).
-  let stable = null, last = null, stableCount = 0;
+  let stable = null, last = null, count = 0;
   while (Date.now() < deadline) {
     const c = newest();
     if (c) {
-      if (last && c.p === last.p && c.size === last.size) stableCount++;
-      else stableCount = 0;
+      if (last && c.p === last.p && c.size === last.size) count++;
+      else count = 0;
       last = c;
-      if (stableCount >= 2) { stable = c.p; break; }
+      if (count >= 2) { stable = c.p; break; }
     }
     await page.waitForTimeout(1000);
   }
-  if (stable) {
-    log("saved (chrome) " + stable);
-    emitOk(stable);
-    process.exit(0);
-  }
+  if (stable) return stable;
 
-  // Fallback: pull the tokenized CDN URL from "Start download manually".
   const manualLink = page.locator('a:has-text("Start download manually")').first();
   let href = null;
   while (Date.now() < deadline) {
@@ -175,17 +190,54 @@ async function main() {
   }
   if (href) {
     log("cdn url: " + href);
+    return await fetchDirect(href, outDir);
+  }
+  throw new Error("timeout: no file downloaded");
+}
+
+async function main() {
+  const { jobs, delay } = parseArgs(process.argv.slice(2));
+  if (!jobs.length) die("no jobs", 1);
+
+  const browser = await chromium.connectOverCDP(CDP);
+  const ctx = browser.contexts()[0];
+  if (!ctx) throw new Error("no browser context over CDP");
+  const page =
+    ctx.pages().find((p) => /nexusmods\.com/.test(p.url())) ||
+    ctx.pages()[0] ||
+    (await ctx.newPage());
+  const cdp = await ctx.newCDPSession(page).catch(() => null);
+
+  const results = [];
+  let failed = 0;
+  for (const job of jobs) {
     try {
-      const saved = await fetchDirect(href, outDir);
-      log("saved (direct) " + saved);
-      emitOk(saved);
-      process.exit(0);
+      const saved = await downloadOne(page, job, cdp);
+      results.push({ target: job.label, ok: true, file: saved });
+      log("saved " + saved);
+      if (!jsonMode) console.log("SAVED " + saved);
     } catch (e) {
-      log("direct fetch failed: " + e.message);
+      failed++;
+      const msg = e?.message || String(e);
+      results.push({ target: job.label, ok: false, error: msg });
+      log("failed " + job.label + ": " + msg);
+      if (!jsonMode) console.log("FAILED " + job.label + ": " + msg);
     }
+    if (delay) await sleep(delay);
   }
 
-  die("timeout: no file downloaded to " + outDir, 2);
+  if (jsonMode) {
+    if (results.length === 1 && results[0].ok) {
+      process.stdout.write(JSON.stringify({ ok: true, file: results[0].file }) + "\n");
+    } else if (results.length === 1) {
+      process.stdout.write(JSON.stringify({ ok: false, error: results[0].error }) + "\n");
+    } else {
+      process.stdout.write(JSON.stringify({ ok: failed === 0, results, succeeded: results.length - failed, failed }) + "\n");
+    }
+  } else if (jobs.length > 1) {
+    log(`done: ${results.length - failed}/${results.length} ok`);
+  }
+  process.exit(failed ? 1 : 0);
 }
 
 main().catch((e) => {

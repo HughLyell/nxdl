@@ -44,8 +44,9 @@ your logins). Leave it running; `nxdl-browser` relaunches it when needed.
 ## Commands
 
 ```bash
-nxdl-browser <game> <mod_id> [file_id] [outdir]   # download (main entry point)
+nxdl-browser <game> <mod_id> [file_id] [outdir]   # download one mod (main entry)
 nxdl-browser <nexusmods-files-url> [outdir]
+nxdl-browser --batch <list-file> [--delay <sec>]  # download many, sequentially
 nxdl whoami                                        # account / premium status
 nxdl files <game> <mod_id>                         # file ids and sizes
 nxdl mod <game> <mod_id>                           # metadata
@@ -58,6 +59,17 @@ Examples:
 ```bash
 nxdl-browser cyberpunk2077 4198                 # main file -> ~/Downloads
 nxdl-browser cyberpunk2077 107 123169 ~/mods    # specific file -> ~/mods
+nxdl-browser --batch mods.txt --delay 5         # batch, 5s between items
+```
+
+Batch file format (one target per line, `#` comments allowed, `-` reads stdin):
+
+```
+# game                mod    file_id  outdir
+cyberpunk2077         4198
+cyberpunk2077         107    123169   ~/mods
+skyrimspecialedition  191276
+https://www.nexusmods.com/cyberpunk2077/mods/2380?tab=files&file_id=139049
 ```
 
 `game` is the URL slug, e.g. `cyberpunk2077`, `skyrimspecialedition`.
@@ -65,19 +77,29 @@ If `file_id` is omitted, the primary file is resolved via the Nexus API.
 
 ## Output contract
 
-`nxdl-browser` prints one machine-readable line on success and exits `0`:
+Single download — one machine-readable line, exit `0`:
 
 ```
 SAVED /home/user/Downloads/ArchiveXL 4198 1.27.3 ....zip
 ```
 
-Set `NXDL_JSON=1` for JSON instead:
+Batch — one line per item, then exit `0` only if all succeeded:
 
-```json
-{"ok":true,"file":"/home/user/Downloads/ArchiveXL 4198 1.27.3 ....zip"}
+```
+SAVED /home/user/Downloads/TweakXL ....zip
+SAVED /home/user/Downloads/ArchiveXL ....zip
+FAILED skyrimspecialedition/191276: timeout
 ```
 
-Exit codes: `0` success, `1` error, `2` timeout (no file).
+Add `--json` (or `NXDL_JSON=1`) for JSON on stdout (logs go to stderr):
+
+```json
+{"ok":true,"file":"/home/user/Downloads/ArchiveXL ....zip"}
+{"ok":false,"results":[{"target":"cyberpunk2077/4197/154092","ok":true,"file":"..."},
+  {"target":"skyrimspecialedition/191276","ok":false,"error":"timeout"}],"succeeded":1,"failed":1}
+```
+
+Exit codes: `0` success, `1` error/any item failed, `2` timeout (no file).
 
 ## Environment
 

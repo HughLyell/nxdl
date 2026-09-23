@@ -23,9 +23,9 @@ done
 [ -n "$SCRIPT" ] || { echo "nxdl-browser: browser-dl.mjs not found (set NXDL_HOME)" >&2; exit 1; }
 
 if [ -x "$BINDIR/nxdl-chrome" ]; then
-  "$BINDIR/nxdl-chrome"
+  "$BINDIR/nxdl-chrome" >&2
 elif command -v nxdl-chrome >/dev/null 2>&1; then
-  nxdl-chrome
+  nxdl-chrome >&2
 else
   echo "nxdl-browser: nxdl-chrome not found" >&2; exit 1
 fi
